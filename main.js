@@ -259,6 +259,16 @@ function getImageMimeType(buffer, contentType) {
   return '';
 }
 
+function normalizeRemoteImageBuffer(buffer, mimeType) {
+  if (mimeType !== 'image/png') return buffer;
+  try {
+    // Strip uncommon PNG metadata (for example C2PA/JUMBF) before canvas decode.
+    return PNG.sync.write(PNG.sync.read(buffer));
+  } catch {
+    throw new Error('Ảnh PNG tải về bị hỏng hoặc không đọc được.');
+  }
+}
+
 async function remoteImageUrlToDataUrl(sourceUrl) {
   let parsedUrl;
   try {
@@ -290,7 +300,8 @@ async function remoteImageUrlToDataUrl(sourceUrl) {
     if (!mimeType) {
       throw new Error('Link nguồn không trả về ảnh PNG, JPG hoặc WEBP. Với Google Drive, hãy đặt quyền Anyone with the link.');
     }
-    return `data:${mimeType};base64,${buffer.toString('base64')}`;
+    const normalizedBuffer = normalizeRemoteImageBuffer(buffer, mimeType);
+    return `data:${mimeType};base64,${normalizedBuffer.toString('base64')}`;
   } finally {
     clearTimeout(timeout);
   }
