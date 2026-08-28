@@ -157,7 +157,8 @@ function formatEnvValue(value) {
 }
 
 async function writeLocalMockupWorkerEnv(config) {
-  const envPath = path.join(__dirname, '.env');
+  // Packaged apps cannot write inside app.asar; persist editable worker config in userData.
+  const envPath = path.join(app.getPath('userData'), '.env');
   const values = {
     OFFOREST_LOCAL_MYSQL_HOST: config.host,
     OFFOREST_LOCAL_MYSQL_PORT: config.port,

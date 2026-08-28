@@ -1,7 +1,7 @@
 {
   "name": "ff-mockup",
   "private": true,
-  "version": "0.0.4",
+  "version": "0.0.5",
   "type": "module",
   "main": "main.js",
   "description": "FF Mockup - local PSD mockup worker",
