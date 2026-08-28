@@ -2925,6 +2925,32 @@ function setupAutoUpdater(win) {
 
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowPrerelease = false;
+  let updateCheckInProgress = false;
+
+  const checkForUpdates = async () => {
+    if (updateCheckInProgress) return;
+    updateCheckInProgress = true;
+    try {
+      const result = await autoUpdater.checkForUpdates();
+      console.log('[AutoUpdater] Checked updates', {
+        currentVersion: app.getVersion(),
+        updateVersion: result?.updateInfo?.version || null,
+      });
+    } catch (error) {
+      console.error('[AutoUpdater] check failed:', error);
+    } finally {
+      updateCheckInProgress = false;
+    }
+  };
+
+  autoUpdater.on('checking-for-update', () => console.log('[AutoUpdater] Checking for update'));
+  autoUpdater.on('update-available', (info) => {
+    console.log('[AutoUpdater] Update available:', info.version);
+  });
+  autoUpdater.on('update-not-available', (info) => {
+    console.log('[AutoUpdater] Already up to date:', info.version);
+  });
 
   autoUpdater.on('update-downloaded', async () => {
     const { response } = await dialog.showMessageBox(win, {
@@ -2945,9 +2971,9 @@ function setupAutoUpdater(win) {
     console.error('[AutoUpdater] Error:', error);
   });
 
-  autoUpdater.checkForUpdatesAndNotify().catch((error) => {
-    console.error('[AutoUpdater] checkForUpdatesAndNotify failed:', error);
-  });
+  // Check once after the window is ready, then periodically while the app stays open.
+  setTimeout(() => { void checkForUpdates(); }, 5000);
+  setInterval(() => { void checkForUpdates(); }, 10 * 60 * 1000);
 }
 
 function createWindow() {
