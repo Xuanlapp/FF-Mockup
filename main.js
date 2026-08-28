@@ -86,11 +86,16 @@ async function ensureBackgroundLocalMockupWorker() {
   const workerArgs = app.isPackaged
     ? ['--local-mockup-worker']
     : [__dirname, '--local-mockup-worker'];
+  const workerDirectory = app.isPackaged ? path.dirname(process.execPath) : __dirname;
   const child = spawn(process.execPath, workerArgs, {
-    cwd: __dirname,
+    // app.asar is virtual and cannot be used as a Windows process working directory.
+    cwd: workerDirectory,
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
+  });
+  child.on('error', (error) => {
+    console.error('[LocalMockupWorker] Background worker spawn failed:', error);
   });
   child.unref();
   return { running: false, starting: true, activeWorkers: 0, lastResult: null };
