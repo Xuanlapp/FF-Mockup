@@ -35,7 +35,7 @@ const GEMINI_CHROME_DEBUG_PORT = Number(process.env.OFFOREST_GEMINI_DEBUG_PORT |
 const GEMINI_CHROME_PROFILE_DIRNAME = 'gemini-chrome-profile';
 const OFFOREST_REPLACED_DESIGN_LAYER = Symbol('offorestReplacedDesignLayer');
 const IS_LOCAL_MOCKUP_WORKER_PROCESS = process.argv.includes('--local-mockup-worker');
-const HAS_LOCAL_MOCKUP_WORKER_LOCK = !IS_LOCAL_MOCKUP_WORKER_PROCESS || app.requestSingleInstanceLock();
+const HAS_UI_INSTANCE_LOCK = IS_LOCAL_MOCKUP_WORKER_PROCESS || app.requestSingleInstanceLock();
 const MAX_REMOTE_MASTER_IMAGE_BYTES = 50 * 1024 * 1024;
 
 let geminiAppWindow = null;
@@ -46,6 +46,7 @@ let geminiLastOutputHash = '';
 let localMockupWorkerTimer = null;
 let localMockupWorkerActiveCount = 0;
 let localMockupWorkerLastResult = null;
+let localMockupWorkerLockHandle = null;
 
 function getLocalMockupWorkerConfigPath() {
   return path.join(app.getPath('userData'), LOCAL_MOCKUP_WORKER_CONFIG_FILE);
@@ -53,6 +54,36 @@ function getLocalMockupWorkerConfigPath() {
 
 function getLocalMockupWorkerStatePath() {
   return path.join(app.getPath('userData'), LOCAL_MOCKUP_WORKER_STATE_FILE);
+}
+
+function getLocalMockupWorkerLockPath() {
+  return path.join(app.getPath('userData'), 'local-mockup-worker.lock');
+}
+
+async function acquireLocalMockupWorkerLock() {
+  const lockPath = getLocalMockupWorkerLockPath();
+  try {
+    localMockupWorkerLockHandle = await fs.open(lockPath, 'wx');
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    try {
+      const lock = JSON.parse(await fs.readFile(lockPath, 'utf8'));
+      process.kill(Number(lock?.pid), 0);
+      return false;
+    } catch {
+      await fs.unlink(lockPath).catch(() => {});
+      localMockupWorkerLockHandle = await fs.open(lockPath, 'wx');
+    }
+  }
+  await localMockupWorkerLockHandle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  return true;
+}
+
+async function releaseLocalMockupWorkerLock() {
+  if (!localMockupWorkerLockHandle) return;
+  await localMockupWorkerLockHandle.close().catch(() => {});
+  localMockupWorkerLockHandle = null;
+  await fs.unlink(getLocalMockupWorkerLockPath()).catch(() => {});
 }
 
 async function writeLocalMockupWorkerState() {
@@ -70,9 +101,16 @@ async function readLocalMockupWorkerState() {
   try {
     const state = JSON.parse(await fs.readFile(getLocalMockupWorkerStatePath(), 'utf8'));
     const updatedAtMs = Date.parse(state?.updatedAt || '');
+    let processIsRunning = false;
+    try {
+      process.kill(Number(state?.pid), 0);
+      processIsRunning = true;
+    } catch {
+      // A stale heartbeat must not prevent the UI from starting a replacement worker.
+    }
     return {
       ...state,
-      running: Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < 10_000,
+      running: processIsRunning && Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < 10_000,
     };
   } catch {
     return { running: false, activeWorkers: 0, lastResult: null };
@@ -245,7 +283,7 @@ function toSafeStoragePath(storageRoot, sourcePath) {
 function imageFileToDataUrl(filePath) {
   return fs.readFile(filePath).then((buffer) => {
     const mimeType = getImageMimeType(buffer, '') || 'image/png';
-    return normalizeMasterImageDataUrl(`data:${mimeType};base64,${buffer.toString('base64')}`);
+    return createMasterImageDataUrl(buffer, mimeType);
   });
 }
 
@@ -265,13 +303,28 @@ function getImageMimeType(buffer, contentType) {
 }
 
 function normalizeRemoteImageBuffer(buffer, mimeType) {
-  if (mimeType !== 'image/png') return buffer;
+  const hasC2paMetadata = mimeType === 'image/png'
+    && (buffer.includes(Buffer.from('jumb')) || buffer.includes(Buffer.from('c2pa')));
+  if (!hasC2paMetadata) return buffer;
   try {
     // Strip uncommon PNG metadata (for example C2PA/JUMBF) before canvas decode.
     return PNG.sync.write(PNG.sync.read(buffer));
   } catch {
     throw new Error('Ảnh PNG tải về bị hỏng hoặc không đọc được.');
   }
+}
+
+function isCmykJpeg(buffer) {
+  if (buffer.subarray(0, 3).toString('hex') !== 'ffd8ff') return false;
+  for (let index = 2; index < buffer.length - 9; index += 1) {
+    if (buffer[index] !== 0xff || buffer[index + 1] === 0x00 || buffer[index + 1] === 0xff) continue;
+    const marker = buffer[index + 1];
+    const isStartOfFrame = marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
+    if (!isStartOfFrame) continue;
+    // SOF: marker (2), length (2), precision (1), height (2), width (2), components (1).
+    return buffer[index + 9] === 4;
+  }
+  return false;
 }
 
 function normalizeMasterImageDataUrl(dataUrl) {
@@ -284,6 +337,14 @@ function normalizeMasterImageDataUrl(dataUrl) {
   } catch {
     throw new Error('Không thể đọc ảnh nguồn. Hãy dùng PNG/JPG/WEBP hợp lệ; ảnh JPEG CMYK sẽ được tự chuyển sang RGB khi decoder hỗ trợ.');
   }
+}
+
+function createMasterImageDataUrl(buffer, mimeType) {
+  const dataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`;
+  // Keep normal RGB images on the fast path; only CMYK JPEG needs conversion.
+  return mimeType === 'image/jpeg' && isCmykJpeg(buffer)
+    ? normalizeMasterImageDataUrl(dataUrl)
+    : dataUrl;
 }
 
 async function remoteImageUrlToDataUrl(sourceUrl) {
@@ -318,7 +379,7 @@ async function remoteImageUrlToDataUrl(sourceUrl) {
       throw new Error('Link nguồn không trả về ảnh PNG, JPG hoặc WEBP. Với Google Drive, hãy đặt quyền Anyone with the link.');
     }
     const normalizedBuffer = normalizeRemoteImageBuffer(buffer, mimeType);
-    return normalizeMasterImageDataUrl(`data:${mimeType};base64,${normalizedBuffer.toString('base64')}`);
+    return createMasterImageDataUrl(normalizedBuffer, mimeType);
   } finally {
     clearTimeout(timeout);
   }
@@ -3038,22 +3099,32 @@ app.whenReady().then(() => {
   }
 
   if (IS_LOCAL_MOCKUP_WORKER_PROCESS) {
-    if (!HAS_LOCAL_MOCKUP_WORKER_LOCK) {
-      app.quit();
-      return;
-    }
-    // The scheduled worker has no renderer window; keep only the queue loop alive.
-    startLocalMockupWorker().then(() => {
-      void writeLocalMockupWorkerState();
-      setInterval(() => { void writeLocalMockupWorkerState(); }, 2000);
-      console.log('[LocalMockupWorker] Background worker started', {
-        concurrency: process.env.OFFOREST_LOCAL_MOCKUP_CONCURRENCY || '1',
-        pollIntervalMs: process.env.OFFOREST_LOCAL_MOCKUP_POLL_MS || '2000',
+    acquireLocalMockupWorkerLock().then((hasWorkerLock) => {
+      if (!hasWorkerLock) {
+        app.quit();
+        return;
+      }
+      // The scheduled worker has no renderer window; keep only the queue loop alive.
+      startLocalMockupWorker().then(() => {
+        void writeLocalMockupWorkerState();
+        setInterval(() => { void writeLocalMockupWorkerState(); }, 2000);
+        console.log('[LocalMockupWorker] Background worker started', {
+          concurrency: process.env.OFFOREST_LOCAL_MOCKUP_CONCURRENCY || '1',
+          pollIntervalMs: process.env.OFFOREST_LOCAL_MOCKUP_POLL_MS || '2000',
+        });
+      }).catch((error) => {
+        console.error('[LocalMockupWorker] Failed to start:', error);
+        app.quit();
       });
     }).catch((error) => {
-      console.error('[LocalMockupWorker] Failed to start:', error);
+      console.error('[LocalMockupWorker] Failed to acquire lock:', error);
       app.quit();
     });
+    return;
+  }
+
+  if (!HAS_UI_INSTANCE_LOCK) {
+    app.quit();
     return;
   }
 
@@ -3078,6 +3149,17 @@ app.whenReady().then(() => {
       createWindow();
     }
   });
+});
+
+app.on('second-instance', () => {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (!win) return;
+  if (win.isMinimized()) win.restore();
+  win.focus();
+});
+
+app.on('before-quit', () => {
+  if (IS_LOCAL_MOCKUP_WORKER_PROCESS) void releaseLocalMockupWorkerLock();
 });
 
 app.on('window-all-closed', () => {
