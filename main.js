@@ -244,9 +244,8 @@ function toSafeStoragePath(storageRoot, sourcePath) {
 
 function imageFileToDataUrl(filePath) {
   return fs.readFile(filePath).then((buffer) => {
-    const extension = path.extname(filePath).toLowerCase();
-    const mimeType = extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : 'image/png';
-    return `data:${mimeType};base64,${buffer.toString('base64')}`;
+    const mimeType = getImageMimeType(buffer, '') || 'image/png';
+    return normalizeMasterImageDataUrl(`data:${mimeType};base64,${buffer.toString('base64')}`);
   });
 }
 
@@ -272,6 +271,18 @@ function normalizeRemoteImageBuffer(buffer, mimeType) {
     return PNG.sync.write(PNG.sync.read(buffer));
   } catch {
     throw new Error('Ảnh PNG tải về bị hỏng hoặc không đọc được.');
+  }
+}
+
+function normalizeMasterImageDataUrl(dataUrl) {
+  try {
+    const { buffer } = dataUrlToBuffer(dataUrl);
+    const image = nativeImage.createFromBuffer(buffer);
+    if (image.isEmpty()) throw new Error('empty image');
+    // Chromium decodes CMYK JPEG, then toPNG writes a standard RGB PNG for ag-psd.
+    return `data:image/png;base64,${image.toPNG().toString('base64')}`;
+  } catch {
+    throw new Error('Không thể đọc ảnh nguồn. Hãy dùng PNG/JPG/WEBP hợp lệ; ảnh JPEG CMYK sẽ được tự chuyển sang RGB khi decoder hỗ trợ.');
   }
 }
 
@@ -307,7 +318,7 @@ async function remoteImageUrlToDataUrl(sourceUrl) {
       throw new Error('Link nguồn không trả về ảnh PNG, JPG hoặc WEBP. Với Google Drive, hãy đặt quyền Anyone with the link.');
     }
     const normalizedBuffer = normalizeRemoteImageBuffer(buffer, mimeType);
-    return `data:${mimeType};base64,${normalizedBuffer.toString('base64')}`;
+    return normalizeMasterImageDataUrl(`data:${mimeType};base64,${normalizedBuffer.toString('base64')}`);
   } finally {
     clearTimeout(timeout);
   }
