@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('offorestMockup', {
   startLocalWorker: () => ipcRenderer.invoke('local-mockup-worker:start'),
   stopLocalWorker: () => ipcRenderer.invoke('local-mockup-worker:stop'),
   getLocalWorkerStatus: () => ipcRenderer.invoke('local-mockup-worker:status'),
+  getLocalWorkerJobs: (payload) => ipcRenderer.invoke('local-mockup-worker:jobs', payload),
   resolveImageDataUrl: ({ sourceUrl }) =>
     ipcRenderer.invoke('mockup:resolve-image-data-url', { sourceUrl }),
   getDefaultPsdFile: () => ipcRenderer.invoke('mockup:default-psd'),

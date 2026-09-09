@@ -2,11 +2,10 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } from 'ele
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { promisify } from 'node:util';
 import electronUpdaterPkg from 'electron-updater';
 import { readPsd, initializeCanvas } from 'ag-psd';
 import { createCanvas, ImageData, loadImage } from '@napi-rs/canvas';
@@ -16,7 +15,6 @@ const PSD = require('psd');
 const { PNG } = require('pngjs');
 const mysql = require('mysql2/promise');
 const dotenv = require('dotenv');
-const execFileAsync = promisify(execFile);
 
 const { autoUpdater } = electronUpdaterPkg;
 
@@ -47,6 +45,7 @@ let localMockupWorkerTimer = null;
 let localMockupWorkerActiveCount = 0;
 let localMockupWorkerLastResult = null;
 let localMockupWorkerLockHandle = null;
+let photoshopRenderQueue = Promise.resolve();
 
 function getLocalMockupWorkerConfigPath() {
   return path.join(app.getPath('userData'), LOCAL_MOCKUP_WORKER_CONFIG_FILE);
@@ -454,7 +453,10 @@ async function processLocalMockupJob(config, job) {
   const outputRelativeDir = path.posix.join('generated', productSlug, 'mockups', String(job.product_design_asset_id));
   const jobOutputDir = path.join(config.storageRoot, ...outputRelativeDir.split('/'));
   await Promise.all([fs.access(psdPath), fs.mkdir(jobOutputDir, { recursive: true })]);
-  const rendered = await renderMockupsFromPsd({ psdPath, designDataUrl: await getMasterImageDataUrl(config, masterSource) });
+  const rendered = await renderLocalMockupWithFallbacks({
+    psdPath,
+    designDataUrl: await getMasterImageDataUrl(config, masterSource),
+  });
   const outputUrls = [];
   for (let index = 0; index < Math.min(rendered.outputs.length, 11); index += 1) {
     const output = rendered.outputs[index];
@@ -605,6 +607,46 @@ async function getLocalMockupWorkerStatus() {
     if (connection) await connection.end();
   }
   return status;
+}
+
+async function getLocalMockupWorkerJobs(payload = {}) {
+  const page = Math.max(1, Math.min(1_000_000, Number.parseInt(payload?.page, 10) || 1));
+  const pageSize = Math.max(5, Math.min(100, Number.parseInt(payload?.pageSize, 10) || 10));
+  const statusFilter = String(payload?.status || 'all').trim().toLowerCase();
+  const allowedStatuses = new Set(['waiting', 'processing', 'completed', 'failed']);
+  const status = allowedStatuses.has(statusFilter) ? statusFilter : null;
+  const whereClause = status ? 'WHERE j.status = ?' : '';
+  const queryParams = status ? [status] : [];
+  let connection;
+
+  try {
+    const config = await getLocalMockupWorkerConfig();
+    connection = await mysql.createConnection({
+      host: config.host, port: config.port, user: config.user, password: config.password, database: config.database, connectTimeout: 10_000,
+    });
+    const [[countRow]] = await connection.query(
+      `SELECT COUNT(*) AS total FROM psd_local_mockup_jobs j ${whereClause}`,
+      queryParams,
+    );
+    const total = Number(countRow?.total) || 0;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const currentPage = Math.min(page, totalPages);
+    const offset = (currentPage - 1) * pageSize;
+    const [jobs] = await connection.query(`
+      SELECT j.id, j.job_uuid, j.product_design_asset_id, j.status, j.executed_by, j.attempts, j.output_urls, j.error_message,
+        j.claimed_at, j.completed_at, j.created_at, a.user_id, a.item_number, p.slug AS product_slug
+      FROM psd_local_mockup_jobs j
+      LEFT JOIN product_design_assets a ON a.id = j.product_design_asset_id
+      LEFT JOIN products p ON p.id = j.product_id
+      ${whereClause}
+      ORDER BY j.id DESC
+      LIMIT ? OFFSET ?
+    `, [...queryParams, pageSize, offset]);
+
+    return { jobs, page: currentPage, pageSize, total, totalPages };
+  } finally {
+    if (connection) await connection.end();
+  }
 }
 
 function enqueueGeminiRedesignTask(taskFn) {
@@ -2265,7 +2307,18 @@ function buildPhotoshopRenderJsx({ psdPath, designImagePath, outputDir }) {
     '  doc.saveAs(new File(outPath), pngOpts, true, Extension.LOWERCASE);',
     '}',
     '',
-    '(function main() {',
+    'function safeOutputName(value) {',
+    '  var name = String(value || "MOCKUP");',
+    '  var invalidChars = "\\\\/:*?\\\"<>|";',
+    '  var result = "";',
+    '  for (var i = 0; i < name.length; i++) {',
+    '    var character = name.charAt(i);',
+    '    result += invalidChars.indexOf(character) >= 0 ? "_" : character;',
+    '  }',
+    '  return result || "MOCKUP";',
+    '}',
+    '',
+    '(function main() { try {',
     `  var psdFile = new File('${psd}');`,
     `  var imageFile = new File('${image}');`,
     `  var outputDir = new Folder('${out}');`,
@@ -2288,12 +2341,23 @@ function buildPhotoshopRenderJsx({ psdPath, designImagePath, outputDir }) {
     '    for (var g = 0; g < groups.length; g++) { original.push(groups[g].visible); }',
     '    for (var j = 0; j < groups.length; j++) {',
     '      for (var k = 0; k < groups.length; k++) groups[k].visible = k === j;',
-    '      var safe = String(groups[j].name).replace(/[\\\\/:*?"<>|]+/g, "_");',
+    '      var safe = safeOutputName(groups[j].name);',
     '      savePng(doc, outputDir.fsName + "/" + safe + ".png");',
     '    }',
     '    for (var r = 0; r < groups.length; r++) groups[r].visible = original[r];',
     '  }',
     '  doc.close(SaveOptions.DONOTSAVECHANGES);',
+    '  var doneFile = new File(outputDir.fsName + "/.offorest-complete");',
+    '  doneFile.open("w");',
+    '  doneFile.write("done");',
+    '  doneFile.close();',
+    '} catch (error) {',
+    '  var errorFile = new File(outputDir.fsName + "/.offorest-error.txt");',
+    '  errorFile.open("w");',
+    '  errorFile.write(String(error));',
+    '  errorFile.close();',
+    '  throw error;',
+    '}',
     '})();',
     '',
   ].join('\n');
@@ -2325,10 +2389,37 @@ async function renderMockupsWithPhotoshopEngine({ psdPath, designDataUrl }) {
   });
   await fs.writeFile(scriptPath, scriptContent, 'utf8');
 
-  await execFileAsync(photoshopExe, ['-r', scriptPath], {
+  const completionPath = path.join(outputDir, '.offorest-complete');
+  const errorPath = path.join(outputDir, '.offorest-error.txt');
+  let launchError = null;
+  const photoshopProcess = spawn(photoshopExe, ['-r', scriptPath], {
     timeout: 10 * 60 * 1000,
     windowsHide: true,
+    stdio: 'ignore',
   });
+  photoshopProcess.once('error', (error) => { launchError = error; });
+
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (Date.now() < deadline) {
+    if (launchError) throw launchError;
+    try {
+      await fs.access(completionPath);
+      break;
+    } catch {
+      try {
+        const scriptError = (await fs.readFile(errorPath, 'utf8')).trim();
+        throw new Error(`Photoshop script failed: ${scriptError || 'unknown error'}`);
+      } catch (error) {
+        if (String(error?.message || '').startsWith('Photoshop script failed:')) throw error;
+      }
+      await sleep(250);
+    }
+  }
+  try {
+    await fs.access(completionPath);
+  } catch {
+    throw new Error('Photoshop không báo hoàn tất export PNG trong 10 phút.');
+  }
 
   const outputFiles = (await fs.readdir(outputDir))
     .filter((name) => /\.png$/i.test(name))
@@ -2354,6 +2445,33 @@ async function renderMockupsWithPhotoshopEngine({ psdPath, designDataUrl }) {
     outputs,
     warning: 'Đã render bằng Photoshop engine để giữ effect sát nhất.',
   };
+}
+
+function renderMockupsWithQueuedPhotoshop(args) {
+  const task = photoshopRenderQueue.then(() => renderMockupsWithPhotoshopEngine(args));
+  photoshopRenderQueue = task.catch(() => {});
+  return task;
+}
+
+async function renderLocalMockupWithFallbacks({ psdPath, designDataUrl }) {
+  let primaryError;
+  try {
+    return await renderMockupsFromPsd({ psdPath, designDataUrl });
+  } catch (error) {
+    primaryError = error;
+    if (!/invalid svg image/i.test(String(error?.message || ''))) throw error;
+    console.warn('[LocalMockupWorker] ag-psd gặp SVG không hợp lệ; chuyển sang Photoshop', error?.message);
+  }
+
+  try {
+    const result = await renderMockupsWithQueuedPhotoshop({ psdPath, designDataUrl });
+    return {
+      ...result,
+      warning: `Đã fallback sang Photoshop sau lỗi ag-psd: ${primaryError?.message || 'Invalid SVG image'}`,
+    };
+  } catch (photoshopError) {
+    throw new Error(`Không thể render PSD sau lỗi SVG. ag-psd: ${primaryError?.message || 'unknown error'}; Photoshop: ${photoshopError?.message || 'unknown error'}`);
+  }
 }
 
 async function renderMockupsFromPsdPreview({ psdPath }) {
@@ -2613,6 +2731,7 @@ function registerMockupIpc() {
     return stopLocalMockupWorker();
   });
   ipcMain.handle('local-mockup-worker:status', async () => getLocalMockupWorkerStatus());
+  ipcMain.handle('local-mockup-worker:jobs', async (_event, payload) => getLocalMockupWorkerJobs(payload));
 
   ipcMain.handle('mockup:resolve-image-data-url', async (_event, payload) => {
     const sourceUrl = String(payload?.sourceUrl || '').trim();
@@ -2747,7 +2866,7 @@ function registerMockupIpc() {
         }
       }
 
-      return await renderMockupsFromPsd({ psdPath, designDataUrl });
+      return await renderLocalMockupWithFallbacks({ psdPath, designDataUrl });
     } catch (error) {
       throw new Error(
         `PSD render failed (${path.basename(psdPath || 'unknown.psd')}, renderer: ${renderer}): ${error?.message || 'unknown error'}`
