@@ -53,14 +53,6 @@ export const stopLocalMockupWorker = async () => getLocalWorkerBridge().stopLoca
 
 export const getLocalMockupWorkerStatus = async () => getLocalWorkerBridge().getLocalWorkerStatus()
 
-export const getLocalMockupWorkerJobs = async ({ page = 1, pageSize = 10, status = 'all' } = {}) => {
-  const bridge = getLocalWorkerBridge()
-  if (typeof bridge.getLocalWorkerJobs !== 'function') {
-    throw new Error('Phiên bản app này chưa hỗ trợ lịch sử job có phân trang.')
-  }
-  return bridge.getLocalWorkerJobs({ page, pageSize, status })
-}
-
 export const getDefaultMockupPsdFile = async () => {
   if (!window?.offorestMockup?.getDefaultPsdFile) {
     return { filePath: null }

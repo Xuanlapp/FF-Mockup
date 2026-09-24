@@ -18,10 +18,16 @@ const dotenv = require('dotenv');
 
 const { autoUpdater } = electronUpdaterPkg;
 
+for (const outputStream of [process.stdout, process.stderr]) {
+  outputStream.on('error', (error) => {
+    if (error?.code !== 'EPIPE') return;
+  });
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Local worker settings in this project's .env must override stale system variables.
-dotenv.config({ path: path.join(__dirname, '.env'), override: true });
+dotenv.config({ path: path.join(__dirname, '.env'), override: true, quiet: true });
 const devServerUrl = process.env.OFFOREST_DEV_SERVER_URL || 'http://127.0.0.1:5173';
 const promptsMoiFilePath = path.join(app.getPath('userData'), 'PromptsMoi.ts');
 const LOCAL_MOCKUP_WORKER_CONFIG_FILE = 'local-mockup-worker.json';
@@ -33,7 +39,11 @@ const GEMINI_CHROME_DEBUG_PORT = Number(process.env.OFFOREST_GEMINI_DEBUG_PORT |
 const GEMINI_CHROME_PROFILE_DIRNAME = 'gemini-chrome-profile';
 const OFFOREST_REPLACED_DESIGN_LAYER = Symbol('offorestReplacedDesignLayer');
 const IS_LOCAL_MOCKUP_WORKER_PROCESS = process.argv.includes('--local-mockup-worker');
-const HAS_UI_INSTANCE_LOCK = IS_LOCAL_MOCKUP_WORKER_PROCESS || app.requestSingleInstanceLock();
+// The UI and background worker are separate Electron processes and must not
+// share the UI single-instance lock. The worker is started by the UI through
+// the persisted worker state, so taking this lock would make it exit whenever
+// the UI is already open.
+const HAS_LOCAL_MOCKUP_WORKER_LOCK = true;
 const MAX_REMOTE_MASTER_IMAGE_BYTES = 50 * 1024 * 1024;
 
 let geminiAppWindow = null;
@@ -44,8 +54,6 @@ let geminiLastOutputHash = '';
 let localMockupWorkerTimer = null;
 let localMockupWorkerActiveCount = 0;
 let localMockupWorkerLastResult = null;
-let localMockupWorkerLockHandle = null;
-let photoshopRenderQueue = Promise.resolve();
 
 function getLocalMockupWorkerConfigPath() {
   return path.join(app.getPath('userData'), LOCAL_MOCKUP_WORKER_CONFIG_FILE);
@@ -53,36 +61,6 @@ function getLocalMockupWorkerConfigPath() {
 
 function getLocalMockupWorkerStatePath() {
   return path.join(app.getPath('userData'), LOCAL_MOCKUP_WORKER_STATE_FILE);
-}
-
-function getLocalMockupWorkerLockPath() {
-  return path.join(app.getPath('userData'), 'local-mockup-worker.lock');
-}
-
-async function acquireLocalMockupWorkerLock() {
-  const lockPath = getLocalMockupWorkerLockPath();
-  try {
-    localMockupWorkerLockHandle = await fs.open(lockPath, 'wx');
-  } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
-    try {
-      const lock = JSON.parse(await fs.readFile(lockPath, 'utf8'));
-      process.kill(Number(lock?.pid), 0);
-      return false;
-    } catch {
-      await fs.unlink(lockPath).catch(() => {});
-      localMockupWorkerLockHandle = await fs.open(lockPath, 'wx');
-    }
-  }
-  await localMockupWorkerLockHandle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-  return true;
-}
-
-async function releaseLocalMockupWorkerLock() {
-  if (!localMockupWorkerLockHandle) return;
-  await localMockupWorkerLockHandle.close().catch(() => {});
-  localMockupWorkerLockHandle = null;
-  await fs.unlink(getLocalMockupWorkerLockPath()).catch(() => {});
 }
 
 async function writeLocalMockupWorkerState() {
@@ -100,16 +78,9 @@ async function readLocalMockupWorkerState() {
   try {
     const state = JSON.parse(await fs.readFile(getLocalMockupWorkerStatePath(), 'utf8'));
     const updatedAtMs = Date.parse(state?.updatedAt || '');
-    let processIsRunning = false;
-    try {
-      process.kill(Number(state?.pid), 0);
-      processIsRunning = true;
-    } catch {
-      // A stale heartbeat must not prevent the UI from starting a replacement worker.
-    }
     return {
       ...state,
-      running: processIsRunning && Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < 10_000,
+      running: Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < 10_000,
     };
   } catch {
     return { running: false, activeWorkers: 0, lastResult: null };
@@ -123,16 +94,11 @@ async function ensureBackgroundLocalMockupWorker() {
   const workerArgs = app.isPackaged
     ? ['--local-mockup-worker']
     : [__dirname, '--local-mockup-worker'];
-  const workerDirectory = app.isPackaged ? path.dirname(process.execPath) : __dirname;
   const child = spawn(process.execPath, workerArgs, {
-    // app.asar is virtual and cannot be used as a Windows process working directory.
-    cwd: workerDirectory,
+    cwd: __dirname,
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
-  });
-  child.on('error', (error) => {
-    console.error('[LocalMockupWorker] Background worker spawn failed:', error);
   });
   child.unref();
   return { running: false, starting: true, activeWorkers: 0, lastResult: null };
@@ -171,6 +137,8 @@ async function resolveXlapPublicStorageRoot(projectPath) {
 }
 
 async function getLocalMockupWorkerConfig() {
+  // Reload local settings so a running background worker picks up UI changes.
+  dotenv.config({ path: path.join(__dirname, '.env'), override: true, quiet: true });
   const defaults = getDefaultLocalMockupWorkerConfig();
   const usesEnvConfig = [
     'OFFOREST_LOCAL_MYSQL_HOST',
@@ -199,8 +167,7 @@ function formatEnvValue(value) {
 }
 
 async function writeLocalMockupWorkerEnv(config) {
-  // Packaged apps cannot write inside app.asar; persist editable worker config in userData.
-  const envPath = path.join(app.getPath('userData'), '.env');
+  const envPath = path.join(__dirname, '.env');
   const values = {
     OFFOREST_LOCAL_MYSQL_HOST: config.host,
     OFFOREST_LOCAL_MYSQL_PORT: config.port,
@@ -262,7 +229,7 @@ function toSafeStoragePath(storageRoot, sourcePath) {
   const publicStorageMarker = '/storage/app/public/';
   const publicStorageIndex = normalizedSourcePath.toLowerCase().indexOf(publicStorageMarker);
   const isStorageRelativePath = /^\/?storage\//i.test(normalizedSourcePath);
-  if (path.isAbsolute(rawPath) && publicStorageIndex === -1 && !isStorageRelativePath) return rawPath;
+  if (path.isAbsolute(rawPath) && publicStorageIndex === -1 && !isStorageRelativePath) return path.normalize(rawPath);
   if (!storageRoot) throw new Error('Chưa cấu hình Storage root local.');
 
   const relativePath = publicStorageIndex >= 0
@@ -279,10 +246,36 @@ function toSafeStoragePath(storageRoot, sourcePath) {
   return resolvedPath;
 }
 
+async function resolveLocalMockupTemplatePath(storageRoot, templateStoragePath) {
+  const directPath = toSafeStoragePath(storageRoot, templateStoragePath);
+  try {
+    await fs.access(directPath);
+    return directPath;
+  } catch (directError) {
+    // Older template rows can retain an absolute path from a previous storage root.
+    const normalizedTemplatePath = String(templateStoragePath || '').replace(/\\/g, '/');
+    const relativeMatch = normalizedTemplatePath.match(/(?:^|\/)psd-mockups\/(.+)$/i);
+    if (!relativeMatch || !storageRoot) throw directError;
+
+    const remappedPath = toSafeStoragePath(storageRoot, `psd-mockups/${relativeMatch[1]}`);
+    try {
+      await fs.access(remappedPath);
+      console.warn('[LocalMockupWorker] Remapped stale PSD template path', {
+        templateStoragePath,
+        remappedPath,
+      });
+      return remappedPath;
+    } catch {
+      throw new Error(`Không tìm thấy file PSD template. Đã thử: ${directPath}; ${remappedPath}`);
+    }
+  }
+}
+
 function imageFileToDataUrl(filePath) {
   return fs.readFile(filePath).then((buffer) => {
-    const mimeType = getImageMimeType(buffer, '') || 'image/png';
-    return createMasterImageDataUrl(buffer, mimeType);
+    const extension = path.extname(filePath).toLowerCase();
+    const mimeType = extension === '.jpg' || extension === '.jpeg' ? 'image/jpeg' : 'image/png';
+    return `data:${mimeType};base64,${buffer.toString('base64')}`;
   });
 }
 
@@ -299,51 +292,6 @@ function getImageMimeType(buffer, contentType) {
   if (buffer.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return 'image/jpeg';
   if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
   return '';
-}
-
-function normalizeRemoteImageBuffer(buffer, mimeType) {
-  const hasC2paMetadata = mimeType === 'image/png'
-    && (buffer.includes(Buffer.from('jumb')) || buffer.includes(Buffer.from('c2pa')));
-  if (!hasC2paMetadata) return buffer;
-  try {
-    // Strip uncommon PNG metadata (for example C2PA/JUMBF) before canvas decode.
-    return PNG.sync.write(PNG.sync.read(buffer));
-  } catch {
-    throw new Error('Ảnh PNG tải về bị hỏng hoặc không đọc được.');
-  }
-}
-
-function isCmykJpeg(buffer) {
-  if (buffer.subarray(0, 3).toString('hex') !== 'ffd8ff') return false;
-  for (let index = 2; index < buffer.length - 9; index += 1) {
-    if (buffer[index] !== 0xff || buffer[index + 1] === 0x00 || buffer[index + 1] === 0xff) continue;
-    const marker = buffer[index + 1];
-    const isStartOfFrame = marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
-    if (!isStartOfFrame) continue;
-    // SOF: marker (2), length (2), precision (1), height (2), width (2), components (1).
-    return buffer[index + 9] === 4;
-  }
-  return false;
-}
-
-function normalizeMasterImageDataUrl(dataUrl) {
-  try {
-    const { buffer } = dataUrlToBuffer(dataUrl);
-    const image = nativeImage.createFromBuffer(buffer);
-    if (image.isEmpty()) throw new Error('empty image');
-    // Chromium decodes CMYK JPEG, then toPNG writes a standard RGB PNG for ag-psd.
-    return `data:image/png;base64,${image.toPNG().toString('base64')}`;
-  } catch {
-    throw new Error('Không thể đọc ảnh nguồn. Hãy dùng PNG/JPG/WEBP hợp lệ; ảnh JPEG CMYK sẽ được tự chuyển sang RGB khi decoder hỗ trợ.');
-  }
-}
-
-function createMasterImageDataUrl(buffer, mimeType) {
-  const dataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`;
-  // Keep normal RGB images on the fast path; only CMYK JPEG needs conversion.
-  return mimeType === 'image/jpeg' && isCmykJpeg(buffer)
-    ? normalizeMasterImageDataUrl(dataUrl)
-    : dataUrl;
 }
 
 async function remoteImageUrlToDataUrl(sourceUrl) {
@@ -377,8 +325,7 @@ async function remoteImageUrlToDataUrl(sourceUrl) {
     if (!mimeType) {
       throw new Error('Link nguồn không trả về ảnh PNG, JPG hoặc WEBP. Với Google Drive, hãy đặt quyền Anyone with the link.');
     }
-    const normalizedBuffer = normalizeRemoteImageBuffer(buffer, mimeType);
-    return createMasterImageDataUrl(normalizedBuffer, mimeType);
+    return `data:${mimeType};base64,${buffer.toString('base64')}`;
   } finally {
     clearTimeout(timeout);
   }
@@ -447,7 +394,7 @@ async function claimLocalMockupJob(connection) {
 
 async function processLocalMockupJob(config, job) {
   const masterSource = job.master_image_uri || job.asset_redesign;
-  const psdPath = toSafeStoragePath(config.storageRoot, job.template_storage_path);
+  const psdPath = await resolveLocalMockupTemplatePath(config.storageRoot, job.template_storage_path);
   const productSlug = String(job.product_slug || '').trim().toLowerCase();
   if (!/^[a-z0-9-]+$/.test(productSlug)) throw new Error('Product slug trong job không hợp lệ.');
   const outputRelativeDir = path.posix.join('generated', productSlug, 'mockups', String(job.product_design_asset_id));
@@ -607,46 +554,6 @@ async function getLocalMockupWorkerStatus() {
     if (connection) await connection.end();
   }
   return status;
-}
-
-async function getLocalMockupWorkerJobs(payload = {}) {
-  const page = Math.max(1, Math.min(1_000_000, Number.parseInt(payload?.page, 10) || 1));
-  const pageSize = Math.max(5, Math.min(100, Number.parseInt(payload?.pageSize, 10) || 10));
-  const statusFilter = String(payload?.status || 'all').trim().toLowerCase();
-  const allowedStatuses = new Set(['waiting', 'processing', 'completed', 'failed']);
-  const status = allowedStatuses.has(statusFilter) ? statusFilter : null;
-  const whereClause = status ? 'WHERE j.status = ?' : '';
-  const queryParams = status ? [status] : [];
-  let connection;
-
-  try {
-    const config = await getLocalMockupWorkerConfig();
-    connection = await mysql.createConnection({
-      host: config.host, port: config.port, user: config.user, password: config.password, database: config.database, connectTimeout: 10_000,
-    });
-    const [[countRow]] = await connection.query(
-      `SELECT COUNT(*) AS total FROM psd_local_mockup_jobs j ${whereClause}`,
-      queryParams,
-    );
-    const total = Number(countRow?.total) || 0;
-    const totalPages = Math.max(1, Math.ceil(total / pageSize));
-    const currentPage = Math.min(page, totalPages);
-    const offset = (currentPage - 1) * pageSize;
-    const [jobs] = await connection.query(`
-      SELECT j.id, j.job_uuid, j.product_design_asset_id, j.status, j.executed_by, j.attempts, j.output_urls, j.error_message,
-        j.claimed_at, j.completed_at, j.created_at, a.user_id, a.item_number, p.slug AS product_slug
-      FROM psd_local_mockup_jobs j
-      LEFT JOIN product_design_assets a ON a.id = j.product_design_asset_id
-      LEFT JOIN products p ON p.id = j.product_id
-      ${whereClause}
-      ORDER BY j.id DESC
-      LIMIT ? OFFSET ?
-    `, [...queryParams, pageSize, offset]);
-
-    return { jobs, page: currentPage, pageSize, total, totalPages };
-  } finally {
-    if (connection) await connection.end();
-  }
 }
 
 function enqueueGeminiRedesignTask(taskFn) {
@@ -2206,6 +2113,7 @@ async function resolvePhotoshopExecutable() {
   }
 
   const candidates = [
+    'C:/Program Files/Adobe/Adobe Photoshop 2026/Photoshop.exe',
     'C:/Program Files/Adobe/Adobe Photoshop 2025/Photoshop.exe',
     'C:/Program Files/Adobe/Adobe Photoshop 2024/Photoshop.exe',
     'C:/Program Files/Adobe/Adobe Photoshop 2023/Photoshop.exe',
@@ -2247,17 +2155,53 @@ function buildPhotoshopRenderJsx({ psdPath, designImagePath, outputDir }) {
     "  return n === 'design' || n === 'desgin';",
     '}',
     '',
-    'function findDesignLayers(parent, result) {',
+    'function findDesignLayers(parent, result, insideMockupGroup) {',
     '  var layers = parent.layers;',
     '  for (var i = 0; i < layers.length; i++) {',
     '    var layer = layers[i];',
-    "    if (layer.typename === 'ArtLayer' && isDesignLayer(layer)) {",
+    "    var isMockupGroup = layer.typename === 'LayerSet' && /^\\s*mockup\\s+\\d+\\s*$/i.test(String(layer.name || ''));",
+    "    if (!insideMockupGroup && layer.typename === 'ArtLayer' && isDesignLayer(layer)) {",
     '      result.push(layer);',
     '    }',
     "    if (layer.typename === 'LayerSet') {",
-    '      findDesignLayers(layer, result);',
+    '      findDesignLayers(layer, result, insideMockupGroup || isMockupGroup);',
     '    }',
     '  }',
+    '}',
+    '',
+    'function findLayerByName(parent, name, insideMockupGroup) {',
+    '  var expectedName = String(name || "").toLowerCase();',
+    '  var layers = parent.layers;',
+    '  for (var i = 0; i < layers.length; i++) {',
+    '    var layer = layers[i];',
+    '    var isMockupGroup = layer.typename === "LayerSet" && /^\\s*mockup\\s+\\d+\\s*$/i.test(String(layer.name || ""));',
+    '    if (!insideMockupGroup && String(layer.name || "").toLowerCase() === expectedName) return layer;',
+    '    if (layer.typename === "LayerSet") {',
+    '      var nested = findLayerByName(layer, name, insideMockupGroup || isMockupGroup);',
+    '      if (nested) return nested;',
+    '    }',
+    '  }',
+    '  return null;',
+    '}',
+    '',
+    'function getBoundsInPixels(layer) {',
+    '  var bounds = layer.bounds;',
+    '  var left = bounds[0].as("px");',
+    '  var top = bounds[1].as("px");',
+    '  var right = bounds[2].as("px");',
+    '  var bottom = bounds[3].as("px");',
+    '  var width = right - left;',
+    '  var height = bottom - top;',
+    '  if (width <= 0 || height <= 0) return null;',
+    '  return { left: left, top: top, width: width, height: height };',
+    '}',
+    '',
+    'function resizeLayerToBounds(layer, targetBounds) {',
+    '  var sourceBounds = getBoundsInPixels(layer);',
+    '  if (!sourceBounds || !targetBounds) return;',
+    '  layer.resize((targetBounds.width / sourceBounds.width) * 100, (targetBounds.height / sourceBounds.height) * 100, AnchorPosition.TOPLEFT);',
+    '  sourceBounds = getBoundsInPixels(layer);',
+    '  layer.translate(targetBounds.left - sourceBounds.left, targetBounds.top - sourceBounds.top);',
     '}',
     '',
     'function replaceSmartObjectContent(layer, imagePath) {',
@@ -2270,17 +2214,23 @@ function buildPhotoshopRenderJsx({ psdPath, designImagePath, outputDir }) {
     '  opened.activeLayer.duplicate(soDoc);',
     '  opened.close(SaveOptions.DONOTSAVECHANGES);',
     '  var newLayer = soDoc.activeLayer;',
-    '  var soW = soDoc.width.as("px");',
-    '  var soH = soDoc.height.as("px");',
-    '  var b = newLayer.bounds;',
-    '  var lw = b[2].as("px") - b[0].as("px");',
-    '  var lh = b[3].as("px") - b[1].as("px");',
-    '  var ratio = Math.min(soW / lw, soH / lh) * 100;',
-    '  newLayer.resize(ratio, ratio, AnchorPosition.MIDDLECENTER);',
-    '  b = newLayer.bounds;',
-    '  var dx = (soW - (b[2].as("px") - b[0].as("px"))) / 2 - b[0].as("px");',
-    '  var dy = (soH - (b[3].as("px") - b[1].as("px"))) / 2 - b[1].as("px");',
-    '  newLayer.translate(dx, dy);',
+    '  var templateLayer = findLayerByName(soDoc, "Template");',
+    '  var targetBounds = templateLayer ? getBoundsInPixels(templateLayer) : null;',
+    '  if (targetBounds) {',
+    '    resizeLayerToBounds(newLayer, targetBounds);',
+    '  } else {',
+    '    var soW = soDoc.width.as("px");',
+    '    var soH = soDoc.height.as("px");',
+    '    var b = newLayer.bounds;',
+    '    var lw = b[2].as("px") - b[0].as("px");',
+    '    var lh = b[3].as("px") - b[1].as("px");',
+    '    var ratio = Math.min(soW / lw, soH / lh) * 100;',
+    '    newLayer.resize(ratio, ratio, AnchorPosition.MIDDLECENTER);',
+    '    b = newLayer.bounds;',
+    '    var dx = (soW - (b[2].as("px") - b[0].as("px"))) / 2 - b[0].as("px");',
+    '    var dy = (soH - (b[3].as("px") - b[1].as("px"))) / 2 - b[1].as("px");',
+    '    newLayer.translate(dx, dy);',
+    '  }',
     '  if (soDoc.layers.length > 1) {',
     '    for (var i = 1; i < soDoc.layers.length; i++) { soDoc.layers[i].visible = false; }',
     '  }',
@@ -2326,11 +2276,14 @@ function buildPhotoshopRenderJsx({ psdPath, designImagePath, outputDir }) {
     '  if (!imageFile.exists) throw new Error("Ảnh design không tồn tại");',
     '  if (!outputDir.exists) outputDir.create();',
     '  var doc = app.open(psdFile);',
+    '  var rootTemplate = findLayerByName(doc, "Template", false);',
+    '  var rootTemplateBounds = rootTemplate ? getBoundsInPixels(rootTemplate) : null;',
     '  var designLayers = [];',
-    '  findDesignLayers(doc, designLayers);',
+    '  findDesignLayers(doc, designLayers, false);',
     '  if (!designLayers.length) throw new Error("Không tìm thấy layer Design/Desgin");',
     '  for (var i = 0; i < designLayers.length; i++) {',
     '    replaceSmartObjectContent(designLayers[i], imageFile.fsName);',
+    '    if (rootTemplateBounds) resizeLayerToBounds(designLayers[i], rootTemplateBounds);',
     '    app.activeDocument = doc;',
     '  }',
     '  var groups = collectTopMockupGroups(doc);',
@@ -2393,11 +2346,12 @@ async function renderMockupsWithPhotoshopEngine({ psdPath, designDataUrl }) {
   const errorPath = path.join(outputDir, '.offorest-error.txt');
   let launchError = null;
   const photoshopProcess = spawn(photoshopExe, ['-r', scriptPath], {
-    timeout: 10 * 60 * 1000,
     windowsHide: true,
     stdio: 'ignore',
   });
-  photoshopProcess.once('error', (error) => { launchError = error; });
+  photoshopProcess.once('error', (error) => {
+    launchError = error;
+  });
 
   const deadline = Date.now() + 10 * 60 * 1000;
   while (Date.now() < deadline) {
@@ -2447,26 +2401,26 @@ async function renderMockupsWithPhotoshopEngine({ psdPath, designDataUrl }) {
   };
 }
 
-function renderMockupsWithQueuedPhotoshop(args) {
-  const task = photoshopRenderQueue.then(() => renderMockupsWithPhotoshopEngine(args));
-  photoshopRenderQueue = task.catch(() => {});
-  return task;
-}
-
 async function renderLocalMockupWithFallbacks({ psdPath, designDataUrl }) {
   let primaryError;
   try {
     return await renderMockupsFromPsd({ psdPath, designDataUrl });
   } catch (error) {
     primaryError = error;
-    if (!/invalid svg image/i.test(String(error?.message || ''))) throw error;
-    console.warn('[LocalMockupWorker] ag-psd gặp SVG không hợp lệ; chuyển sang Photoshop', error?.message);
+    if (!/invalid svg image/i.test(String(error?.message || ''))) {
+      throw error;
+    }
+    try {
+      console.warn('[LocalMockupWorker] ag-psd gặp SVG không hợp lệ; chuyển sang Photoshop', error?.message);
+    } catch (logError) {
+      if (logError?.code !== 'EPIPE') throw logError;
+    }
   }
 
   try {
-    const result = await renderMockupsWithQueuedPhotoshop({ psdPath, designDataUrl });
+    const photoshopResult = await renderMockupsWithPhotoshopEngine({ psdPath, designDataUrl });
     return {
-      ...result,
+      ...photoshopResult,
       warning: `Đã fallback sang Photoshop sau lỗi ag-psd: ${primaryError?.message || 'Invalid SVG image'}`,
     };
   } catch (photoshopError) {
@@ -2731,7 +2685,6 @@ function registerMockupIpc() {
     return stopLocalMockupWorker();
   });
   ipcMain.handle('local-mockup-worker:status', async () => getLocalMockupWorkerStatus());
-  ipcMain.handle('local-mockup-worker:jobs', async (_event, payload) => getLocalMockupWorkerJobs(payload));
 
   ipcMain.handle('mockup:resolve-image-data-url', async (_event, payload) => {
     const sourceUrl = String(payload?.sourceUrl || '').trim();
@@ -2848,22 +2801,8 @@ function registerMockupIpc() {
         return await renderPsdReplaceDesignFull({ psdPath, designDataUrl });
       }
 
-      if (renderer === 'ag-psd' && preferPhotoshopForAgPsd) {
-        try {
-          const photoshopResult = await renderMockupsWithPhotoshopEngine({ psdPath, designDataUrl });
-          return {
-            ...photoshopResult,
-            warning: photoshopResult?.warning
-              ? `${photoshopResult.warning} (auto-selected over ag-psd để giữ skew/shape tốt hơn)`
-              : 'Đã tự động dùng Photoshop engine thay cho ag-psd để giữ skew/shape tốt hơn.',
-          };
-        } catch (photoshopError) {
-          const agPsdResult = await renderMockupsFromPsd({ psdPath, designDataUrl });
-          return {
-            ...agPsdResult,
-            warning: `Không bật được Photoshop engine, tiếp tục bằng ag-psd: ${photoshopError?.message || 'unknown error'}`,
-          };
-        }
+      if (renderer === 'ag-psd') {
+        return await renderLocalMockupWithFallbacks({ psdPath, designDataUrl });
       }
 
       return await renderLocalMockupWithFallbacks({ psdPath, designDataUrl });
@@ -3133,32 +3072,6 @@ function setupAutoUpdater(win) {
 
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.allowPrerelease = false;
-  let updateCheckInProgress = false;
-
-  const checkForUpdates = async () => {
-    if (updateCheckInProgress) return;
-    updateCheckInProgress = true;
-    try {
-      const result = await autoUpdater.checkForUpdates();
-      console.log('[AutoUpdater] Checked updates', {
-        currentVersion: app.getVersion(),
-        updateVersion: result?.updateInfo?.version || null,
-      });
-    } catch (error) {
-      console.error('[AutoUpdater] check failed:', error);
-    } finally {
-      updateCheckInProgress = false;
-    }
-  };
-
-  autoUpdater.on('checking-for-update', () => console.log('[AutoUpdater] Checking for update'));
-  autoUpdater.on('update-available', (info) => {
-    console.log('[AutoUpdater] Update available:', info.version);
-  });
-  autoUpdater.on('update-not-available', (info) => {
-    console.log('[AutoUpdater] Already up to date:', info.version);
-  });
 
   autoUpdater.on('update-downloaded', async () => {
     const { response } = await dialog.showMessageBox(win, {
@@ -3179,9 +3092,9 @@ function setupAutoUpdater(win) {
     console.error('[AutoUpdater] Error:', error);
   });
 
-  // Check once after the window is ready, then periodically while the app stays open.
-  setTimeout(() => { void checkForUpdates(); }, 5000);
-  setInterval(() => { void checkForUpdates(); }, 10 * 60 * 1000);
+  autoUpdater.checkForUpdatesAndNotify().catch((error) => {
+    console.error('[AutoUpdater] checkForUpdatesAndNotify failed:', error);
+  });
 }
 
 function createWindow() {
@@ -3218,32 +3131,22 @@ app.whenReady().then(() => {
   }
 
   if (IS_LOCAL_MOCKUP_WORKER_PROCESS) {
-    acquireLocalMockupWorkerLock().then((hasWorkerLock) => {
-      if (!hasWorkerLock) {
-        app.quit();
-        return;
-      }
-      // The scheduled worker has no renderer window; keep only the queue loop alive.
-      startLocalMockupWorker().then(() => {
-        void writeLocalMockupWorkerState();
-        setInterval(() => { void writeLocalMockupWorkerState(); }, 2000);
-        console.log('[LocalMockupWorker] Background worker started', {
-          concurrency: process.env.OFFOREST_LOCAL_MOCKUP_CONCURRENCY || '1',
-          pollIntervalMs: process.env.OFFOREST_LOCAL_MOCKUP_POLL_MS || '2000',
-        });
-      }).catch((error) => {
-        console.error('[LocalMockupWorker] Failed to start:', error);
-        app.quit();
+    if (!HAS_LOCAL_MOCKUP_WORKER_LOCK) {
+      app.quit();
+      return;
+    }
+    // The scheduled worker has no renderer window; keep only the queue loop alive.
+    startLocalMockupWorker().then(() => {
+      void writeLocalMockupWorkerState();
+      setInterval(() => { void writeLocalMockupWorkerState(); }, 2000);
+      console.log('[LocalMockupWorker] Background worker started', {
+        concurrency: process.env.OFFOREST_LOCAL_MOCKUP_CONCURRENCY || '1',
+        pollIntervalMs: process.env.OFFOREST_LOCAL_MOCKUP_POLL_MS || '2000',
       });
     }).catch((error) => {
-      console.error('[LocalMockupWorker] Failed to acquire lock:', error);
+      console.error('[LocalMockupWorker] Failed to start:', error);
       app.quit();
     });
-    return;
-  }
-
-  if (!HAS_UI_INSTANCE_LOCK) {
-    app.quit();
     return;
   }
 
@@ -3270,19 +3173,9 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('second-instance', () => {
-  const win = BrowserWindow.getAllWindows()[0];
-  if (!win) return;
-  if (win.isMinimized()) win.restore();
-  win.focus();
-});
-
-app.on('before-quit', () => {
-  if (IS_LOCAL_MOCKUP_WORKER_PROCESS) void releaseLocalMockupWorkerLock();
-});
-
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
   }
 });
+

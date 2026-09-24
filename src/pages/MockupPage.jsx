@@ -3,7 +3,6 @@ import { updateRecordInSheet } from '../services/googleDriveService'
 import {
     getDefaultMockupPsdFile,
     getLocalMockupWorkerConfig,
-    getLocalMockupWorkerJobs,
     getLocalMockupWorkerStatus,
     pickLocalMockupWorkerStorageRoot,
     pickLocalMockupWorkerXlapProject,
@@ -54,9 +53,6 @@ export default function MockupPage() {
     const [isListedItemsModalOpen, setIsListedItemsModalOpen] = useState(false)
     const [localWorkerConfig, setLocalWorkerConfig] = useState(null)
     const [localWorkerStatus, setLocalWorkerStatus] = useState(null)
-    const [localJobHistory, setLocalJobHistory] = useState({ jobs: [], page: 1, pageSize: 10, total: 0, totalPages: 1 })
-    const [localJobHistoryStatus, setLocalJobHistoryStatus] = useState('all')
-    const [isLocalJobHistoryLoading, setIsLocalJobHistoryLoading] = useState(false)
     const [localWorkerMessage, setLocalWorkerMessage] = useState('')
     const [isLocalWorkerSaving, setIsLocalWorkerSaving] = useState(false)
     const [isLocalWorkerSettingsOpen, setIsLocalWorkerSettingsOpen] = useState(false)
@@ -73,32 +69,6 @@ export default function MockupPage() {
         return () => window.removeEventListener('mockupGetData', onGetData)
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
-
-    useEffect(() => {
-        let isActive = true
-        const loadLocalJobHistory = async () => {
-            setIsLocalJobHistoryLoading(true)
-            try {
-                const result = await getLocalMockupWorkerJobs({
-                    page: localJobHistory.page,
-                    pageSize: localJobHistory.pageSize,
-                    status: localJobHistoryStatus,
-                })
-                if (isActive) setLocalJobHistory(result)
-            } catch (workerError) {
-                if (isActive) setLocalWorkerMessage(workerError.message || 'Không thể tải lịch sử job.')
-            } finally {
-                if (isActive) setIsLocalJobHistoryLoading(false)
-            }
-        }
-
-        loadLocalJobHistory()
-        const intervalId = window.setInterval(loadLocalJobHistory, 5000)
-        return () => {
-            isActive = false
-            window.clearInterval(intervalId)
-        }
-    }, [localJobHistory.page, localJobHistory.pageSize, localJobHistoryStatus])
 
     useEffect(() => {
         const loadLocalWorker = async () => {
@@ -189,7 +159,7 @@ export default function MockupPage() {
     useEffect(() => {
         let isActive = true
         const loadCompletedJobImages = async () => {
-            const completedJobs = (localJobHistory?.jobs || []).filter((job) => job.status === 'completed')
+            const completedJobs = (localWorkerStatus?.jobs || []).filter((job) => job.status === 'completed')
             const missingJobs = completedJobs.filter((job) => !Object.hasOwn(localJobImageUrls, job.id))
 
             for (const job of missingJobs) {
@@ -220,7 +190,7 @@ export default function MockupPage() {
 
         loadCompletedJobImages()
         return () => { isActive = false }
-    }, [localJobHistory, localJobImageUrls])
+    }, [localWorkerStatus, localJobImageUrls])
 
     const handleLocalWorkerToggle = async () => {
         if (!localWorkerConfig) return
@@ -959,42 +929,9 @@ export default function MockupPage() {
                         <span className="rounded-full bg-rose-100 px-2 py-1 text-rose-800">Lỗi: {localWorkerStatus?.summary?.failed || 0}</span>
                     </div>
                     {localWorkerStatus?.error ? <p className="mt-2 text-xs text-rose-700">Không thể đọc queue: {localWorkerStatus.error}</p> : null}
-                    <div className="mt-3 rounded-xl border border-zinc-200 bg-white p-3">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                            <div>
-                                <p className="text-sm font-semibold text-zinc-900">Các job đã làm</p>
-                                <p className="text-xs text-zinc-500">Hiển thị {localJobHistory.total} job, mới nhất trước.</p>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <select
-                                    value={localJobHistoryStatus}
-                                    onChange={(event) => {
-                                        setLocalJobHistoryStatus(event.target.value)
-                                        setLocalJobHistory((previous) => ({ ...previous, page: 1 }))
-                                    }}
-                                    className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs"
-                                >
-                                    <option value="all">Tất cả trạng thái</option>
-                                    <option value="completed">Đã xong</option>
-                                    <option value="waiting">Chờ xử lý</option>
-                                    <option value="processing">Đang làm</option>
-                                    <option value="failed">Lỗi</option>
-                                </select>
-                                <select
-                                    value={localJobHistory.pageSize}
-                                    onChange={(event) => setLocalJobHistory((previous) => ({ ...previous, page: 1, pageSize: Number(event.target.value) }))}
-                                    className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs"
-                                >
-                                    <option value={5}>5 / trang</option>
-                                    <option value={10}>10 / trang</option>
-                                    <option value={20}>20 / trang</option>
-                                    <option value={50}>50 / trang</option>
-                                </select>
-                            </div>
-                        </div>
-                    {localJobHistory?.jobs?.length ? (
+                    {localWorkerStatus?.jobs?.length ? (
                         <div className="mt-2 overflow-hidden rounded-lg border border-zinc-200 bg-white text-xs">
-                            {localJobHistory.jobs.map((job) => {
+                            {localWorkerStatus.jobs.map((job) => {
                                 const outputUrls = getLocalJobOutputUrls(job)
                                 const storedOutputUrls = getStoredLocalJobOutputUrls(job)
                                 const canPreview = job.status === 'completed' && outputUrls.length > 0
@@ -1025,27 +962,7 @@ export default function MockupPage() {
                                 )
                             })}
                         </div>
-                    ) : <p className="mt-3 text-xs text-zinc-500">{isLocalJobHistoryLoading ? 'Đang tải lịch sử job...' : 'Chưa có job mockup nào.'}</p>}
-                        <div className="mt-3 flex flex-wrap items-center justify-center gap-2 text-xs">
-                            <button
-                                type="button"
-                                disabled={isLocalJobHistoryLoading || localJobHistory.page <= 1}
-                                onClick={() => setLocalJobHistory((previous) => ({ ...previous, page: Math.max(1, previous.page - 1) }))}
-                                className="rounded border border-zinc-300 px-2 py-1 font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40"
-                            >
-                                ← Trước
-                            </button>
-                            <span className="text-zinc-600">Trang {localJobHistory.page} / {localJobHistory.totalPages}</span>
-                            <button
-                                type="button"
-                                disabled={isLocalJobHistoryLoading || localJobHistory.page >= localJobHistory.totalPages}
-                                onClick={() => setLocalJobHistory((previous) => ({ ...previous, page: Math.min(previous.totalPages, previous.page + 1) }))}
-                                className="rounded border border-zinc-300 px-2 py-1 font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40"
-                            >
-                                Sau →
-                            </button>
-                        </div>
-                    </div>
+                    ) : <p className="mt-2 text-xs text-zinc-500">Chưa có job mockup nào.</p>}
                     {isLocalWorkerSettingsOpen ? (
                 <div className="mt-2 rounded-xl border border-sky-200 bg-sky-50 p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
